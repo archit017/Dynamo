@@ -1,6 +1,8 @@
 package edu.buffalo.cse.cse486586.simpledynamo;
 
 import java.io.BufferedReader;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
@@ -17,6 +19,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Semaphore;
 
 import android.content.ContentProvider;
 import android.content.ContentValues;
@@ -40,7 +43,12 @@ public class SimpleDynamoProvider extends ContentProvider {
     private static String delim = "`";
     private static String INSERT_KEY = "InsertKeyValue";
     private static String REPLICATE_KEY = "ReplicateKeyValue";
+    private static String QUERY_KEY = "QueryStuff";
+    private static String QUERY_RESULT = "AhaResult!";
     static final int SERVER_PORT = 10000;
+
+    Semaphore waitForQuery = new Semaphore(0);
+    private String queryResult;
 
     @Override
     public boolean onCreate() {
@@ -115,7 +123,12 @@ public class SimpleDynamoProvider extends ContentProvider {
         String hash = findNode(genHash(args[1]));
         Log.v("insert", "hash " + genHash(args[1]) + " " + hash);
 //        String node = findNode(hash);
-        sendMessage(insDht, nodePortMap.get(hash));
+        //In case of head failure send Insert to backup store
+        if (!sendMessage(insDht, nodePortMap.get(hash))) {
+            int index = nodeHashList.indexOf(hash);
+            index = (index + 1) % 5;
+            sendMessage(insDht, nodePortMap.get(nodeHashList.get(index)));
+        }
 
         return null;
     }
@@ -124,8 +137,34 @@ public class SimpleDynamoProvider extends ContentProvider {
     @Override
     public Cursor query(Uri uri, String[] projection, String selection,
                         String[] selectionArgs, String sortOrder) {
-        // TODO Auto-generated method stub
-        return null;
+        MatrixHelper cursorBuilder=null;
+        //TODO implement rejoin as a query call. loop over local query results and check hash
+        if (selection.equals("@")) {
+            //TODO LDump
+        } else if (selection.equals("*")) {
+            //TODO GDump
+        } else {
+            String queryDht = QUERY_KEY + delim + selection + delim + myPort;
+            String hash = findNode(genHash(selection));
+            Log.v(TAG, "query : " + queryDht + " " + hash + " key->" + genHash(selection));
+            int index = nodeHashList.indexOf(hash);
+            hash = nodeHashList.get((index + 2) % 5);
+            if (!sendMessage(queryDht, nodePortMap.get(hash))) {
+                index = (index + 1) % 5;
+                sendMessage(queryDht, nodePortMap.get(nodeHashList.get(index)));
+            }
+            try {
+                waitForQuery.acquire();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+            Log.v("QueryResult", queryResult + " " + selection);
+            if (queryResult == "")
+                return null;
+            cursorBuilder = new MatrixHelper(selection + delim + queryResult);
+        }
+
+        return cursorBuilder.cursor;
     }
 
     @Override
@@ -171,12 +210,18 @@ public class SimpleDynamoProvider extends ContentProvider {
                             String replicationMessage = REPLICATE_KEY + delim + args[1] + delim + args[2];
                             sendMessage(replicationMessage, backupStorePorts[0]);
                             sendMessage(replicationMessage, backupStorePorts[1]);
-                        } else{
+                        } else {
                             String replicationMessage = REPLICATE_KEY + delim + args[1] + delim + args[2];
                             sendMessage(replicationMessage, backupStorePorts[0]);
                         }
                     } else if (args[0].equals(REPLICATE_KEY)) {
                         localInsert(args[1], args[2]);
+                    } else if (args[0].equals(QUERY_KEY)) {
+                        localQuery(args[1], Integer.parseInt(args[2]));
+                    } else if (args[0].equals(QUERY_RESULT)) {
+                        message = message.substring(message.indexOf(delim)+1);
+                        queryResult = message;
+                        waitForQuery.release();
                     }
                     clientHook.close();
                     //serverSocket.close();
@@ -199,6 +244,26 @@ public class SimpleDynamoProvider extends ContentProvider {
             key_store = getContext().openFileOutput(key, Context.MODE_PRIVATE);
             key_store.write(value.getBytes());
             key_store.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+    private void localQuery(String key, Integer port) {
+        FileInputStream key_retrieve = null;
+        try {
+            String message;
+            key_retrieve = getContext().openFileInput(key);
+            if (key_retrieve == null)
+                message = null;
+            else {
+                BufferedReader buf = new BufferedReader(new InputStreamReader(key_retrieve));
+                message = buf.readLine();
+            }
+            Log.v("query", "key " + key + " value " + message);
+            String queryResult = QUERY_RESULT + delim + message;
+            sendMessage(queryResult, port);
+        } catch (FileNotFoundException e) {
+            e.printStackTrace();
         } catch (IOException e) {
             e.printStackTrace();
         }
