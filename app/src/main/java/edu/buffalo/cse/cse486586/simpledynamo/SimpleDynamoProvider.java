@@ -40,6 +40,7 @@ public class SimpleDynamoProvider extends ContentProvider {
     private int myPort;
     private String localNodeID;
     private String prevNodeID;
+    HashMap<String, Semaphore> concurrentQueries;
 
     private static String delim = "`";
     private static String INSERT_KEY = "InsertKeyValue";
@@ -85,6 +86,7 @@ public class SimpleDynamoProvider extends ContentProvider {
         Log.v(TAG, "Node hash space" + nodeHashList);
         Log.v(TAG, "ports" + nodePortMap);
 
+        concurrentQueries = new HashMap<String, Semaphore>();
         //get next two neighbours
         backupStorePorts = new Integer[2];
         localNodeID = genHash(String.valueOf(myPort / 2));
@@ -103,24 +105,23 @@ public class SimpleDynamoProvider extends ContentProvider {
         if (selection.equals("@")) {
             Log.v("DHTDel", "Local delete");
             deleteLocal();
-        } else if (selection.equals("*")){
+        } else if (selection.equals("*")) {
             String queryAllDht = DELETE_ALL + delim + myPort;
             int[] ports = {5554, 5556, 5558, 5560, 5562};
             for (int port :
                     ports) {
-                sendMessage(queryAllDht, port*2);
+                sendMessage(queryAllDht, port * 2);
             }
-        }
-        else {
+        } else {
             String deleteKey = DELETE_KEY + delim + selection;
             Log.v("Delete Result", deleteKey);
             String hash = findNode(genHash(selection));
             Log.v(TAG, "query : " + deleteKey + " " + hash + " key->" + genHash(selection));
             int index = nodeHashList.indexOf(hash);
             sendMessage(deleteKey, nodePortMap.get(nodeHashList.get(index)));
-            index = (index+1)%5;
+            index = (index + 1) % 5;
             sendMessage(deleteKey, nodePortMap.get(nodeHashList.get(index)));
-            index = (index+1)%5;
+            index = (index + 1) % 5;
             sendMessage(deleteKey, nodePortMap.get(nodeHashList.get(index)));
         }
         return 0; //TODO return what?
@@ -178,8 +179,10 @@ public class SimpleDynamoProvider extends ContentProvider {
             //TODO GDump
             String queryAllDht = QUERY_ALL + delim + myPort;
             sendMessage(queryAllDht, myPort);
+            Semaphore sem = new Semaphore(0);
+            concurrentQueries.put("*", sem);
             try {
-                waitForQuery.acquire();
+                sem.acquire();
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
@@ -194,12 +197,15 @@ public class SimpleDynamoProvider extends ContentProvider {
             Log.v(TAG, "query : " + queryDht + " " + hash + " key->" + genHash(selection));
             int index = nodeHashList.indexOf(hash);
             hash = nodeHashList.get((index + 2) % 5);
+            Log.v(TAG, "Insert " + selection);
+            Semaphore sem = new Semaphore(0);
+            concurrentQueries.put(selection, sem);
             if (!sendMessage(queryDht, nodePortMap.get(hash))) {
                 index = (index + 1) % 5;
                 sendMessage(queryDht, nodePortMap.get(nodeHashList.get(index)));
             }
             try {
-                waitForQuery.acquire();
+                sem.acquire();
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
@@ -266,11 +272,14 @@ public class SimpleDynamoProvider extends ContentProvider {
                         queryAll(message);
                     } else if (args[0].equals(QUERY_RESULT)) {
                         message = message.substring(message.indexOf(delim) + 1);
+                        message = message.substring(message.indexOf(delim) + 1);
+                        Log.v(TAG, "Message " + message + " " + args[1]);
                         queryResult = message;
-                        waitForQuery.release();
-                    } else if (args[0].equals(DELETE_ALL)){
+                        concurrentQueries.get(args[1]).release();
+//                        waitForQuery.release();
+                    } else if (args[0].equals(DELETE_ALL)) {
                         deleteLocal();
-                    } else if(args[0].equals(DELETE_KEY)){
+                    } else if (args[0].equals(DELETE_KEY)) {
                         Log.v("Delete", "Delete local file " + args[1]);
                         File del = new File(getContext().getFilesDir().getAbsolutePath() + "/" + args[1]);
                         del.delete();
@@ -313,7 +322,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                 message = buf.readLine();
             }
             Log.v("query", "key " + key + " value " + message);
-            String queryResult = QUERY_RESULT + delim + message;
+            String queryResult = QUERY_RESULT + delim + key + delim + message;
             sendMessage(queryResult, port);
         } catch (FileNotFoundException e) {
             e.printStackTrace();
@@ -321,34 +330,35 @@ public class SimpleDynamoProvider extends ContentProvider {
             e.printStackTrace();
         }
     }
-    void queryAll(String message){
+
+    void queryAll(String message) {
         String[] args = message.split(delim);
 
         String localValues = localQueryAll();
-        boolean fin=false;
+        boolean fin = false;
 
-        if(localValues!=null)
+        if (localValues != null)
             message = message + delim + localValues.substring(0, localValues.lastIndexOf(delim));
-        if(backupStorePorts[0] == Integer.parseInt(args[1])) {
-            message = message.substring(message.indexOf(delim)+1);
-            if(message.indexOf(delim)>=0){
-                message = message.substring(message.indexOf(delim)+1);
-            }else{
+        if (backupStorePorts[0] == Integer.parseInt(args[1])) {
+            message = message.substring(message.indexOf(delim) + 1);
+            if (message.indexOf(delim) >= 0) {
+                message = message.substring(message.indexOf(delim) + 1);
+            } else {
                 message = "";
             }
-            message = QUERY_RESULT + delim + message;
+            message = QUERY_RESULT + delim + "*" + delim + message;
             fin = true;
         }
         //Failure handling
-        if(!sendMessage(message,backupStorePorts[0])){
-            if(!fin && backupStorePorts[1] == Integer.parseInt(args[1])) {
-                message = message.substring(message.indexOf(delim)+1);
-                if(message.indexOf(delim)>=0){
-                    message = message.substring(message.indexOf(delim)+1);
-                }else{
+        if (!sendMessage(message, backupStorePorts[0])) {
+            if (!fin && backupStorePorts[1] == Integer.parseInt(args[1])) {
+                message = message.substring(message.indexOf(delim) + 1);
+                if (message.indexOf(delim) >= 0) {
+                    message = message.substring(message.indexOf(delim) + 1);
+                } else {
                     message = "";
                 }
-                message = QUERY_RESULT + delim + message;
+                message = QUERY_RESULT + delim + "*" + message;
                 fin = true;
             }
             sendMessage(message, backupStorePorts[1]);
@@ -386,10 +396,11 @@ public class SimpleDynamoProvider extends ContentProvider {
         }
         return queryAll;
     }
+
     private void deleteLocal() {
         File dir = getContext().getFilesDir();
         File[] deleteKeys = dir.listFiles();
-        for(File del:deleteKeys){
+        for (File del : deleteKeys) {
             Log.v("DeleteLocal", del.getName());
             del.delete();
         }
