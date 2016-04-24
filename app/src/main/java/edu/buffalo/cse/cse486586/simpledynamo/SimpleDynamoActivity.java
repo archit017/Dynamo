@@ -7,6 +7,8 @@ import android.util.Log;
 import android.view.Menu;
 import android.widget.TextView;
 
+import java.io.File;
+
 public class SimpleDynamoActivity extends Activity {
 
 	@Override
@@ -36,6 +38,12 @@ public class SimpleDynamoActivity extends Activity {
 	
 	public void onStop() {
         super.onStop();
+		File dir = this.getFilesDir();
+		File[] deleteKeys = dir.listFiles();
+		for (File del : deleteKeys) {
+			Log.v("DeleteLocal", del.getName());
+			del.delete();
+		}
 	    Log.v("Test", "onStop()");
 	}
 }
