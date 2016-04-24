@@ -7,7 +7,7 @@ import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.io.OutputStream;
+import java.io.PrintWriter;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -50,6 +50,10 @@ public class SimpleDynamoProvider extends ContentProvider {
     private static String QUERY_RESULT = "AhaResult!";
     private static String DELETE_KEY = "DeleteKey!";
     private static String DELETE_ALL = "DeleteEverything";
+    private static String JOIN_PREV_NODE = "Join!";
+    private static String JOIN_NEXT = "Joinnext!";
+    private static String JOIN_RESULT = "Joinresult";
+
     static final int SERVER_PORT = 10000;
 
     Semaphore waitForQuery = new Semaphore(0);
@@ -90,13 +94,26 @@ public class SimpleDynamoProvider extends ContentProvider {
         //get next two neighbours
         backupStorePorts = new Integer[2];
         localNodeID = genHash(String.valueOf(myPort / 2));
-        int i = nodeHashList.indexOf(localNodeID);
+        final int i = nodeHashList.indexOf(localNodeID);
         prevNodeID = nodeHashList.get((i + 4) % 5);
         Log.v(TAG, "index " + i);
         nodePortMap.get(nodeHashList.get((i + 1) % 5));
         backupStorePorts[0] = nodePortMap.get(nodeHashList.get((i + 1) % 5));
         backupStorePorts[1] = nodePortMap.get(nodeHashList.get((i + 2) % 5));
         Log.v(TAG, "neighbours " + backupStorePorts[0] + " " + backupStorePorts[1]);
+//        final String resurrect = JOIN_NODE + delim + myPort;
+        //TODO change for consistent failure
+        Thread run = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                String resurrect = JOIN_PREV_NODE + delim + myPort;
+                sendMessage(resurrect, nodePortMap.get(nodeHashList.get((i + 3) % 5)));
+                sendMessage(resurrect, nodePortMap.get(nodeHashList.get((i + 4) % 5)));
+                resurrect = JOIN_NEXT + delim + myPort;
+                sendMessage(resurrect, backupStorePorts[0]);
+            }
+        });
+        run.start();
         return false;
     }
 
@@ -144,18 +161,28 @@ public class SimpleDynamoProvider extends ContentProvider {
             args[i++] = (String) keypair.getValue();
         }
         Log.v("insert", args[1] + " " + args[0]);
+        String hash = genHash(args[1]);
 
-        String insDht = INSERT_KEY + delim + args[1] + delim + args[0];
+        if (isInHashSpace(hash, prevNodeID, localNodeID)) {
+            localInsert(args[1], args[0]);
+            String replicationMessage = REPLICATE_KEY + delim + args[1] + delim + args[0];
+            sendMessage(replicationMessage, backupStorePorts[0]);
+            sendMessage(replicationMessage, backupStorePorts[1]);
+        } else {
 
-        String hash = findNode(genHash(args[1]));
-        Log.v("insert", "hash " + genHash(args[1]) + " " + hash);
+            String insDht = INSERT_KEY + delim + args[1] + delim + args[0];
+
+            hash = findNode(genHash(args[1]));
+            Log.v("insert", "hash " + genHash(args[1]) + " " + hash);
 //        String node = findNode(hash);
-        //In case of head failure send Insert to backup store
-        if (!sendMessage(insDht, nodePortMap.get(hash))) {
-            int index = nodeHashList.indexOf(hash);
-            index = (index + 1) % 5;
-            sendMessage(insDht, nodePortMap.get(nodeHashList.get(index)));
+            //In case of head failure send Insert to backup store
+            if (!sendMessageFail(insDht, nodePortMap.get(hash))) {
+                int index = nodeHashList.indexOf(hash);
+                index = (index + 1) % 5;
+                sendMessageFail(insDht, nodePortMap.get(nodeHashList.get(index)));
+            }
         }
+
 
         return null;
     }
@@ -200,9 +227,9 @@ public class SimpleDynamoProvider extends ContentProvider {
             Log.v(TAG, "Insert " + selection);
             Semaphore sem = new Semaphore(0);
             concurrentQueries.put(selection, sem);
-            if (!sendMessage(queryDht, nodePortMap.get(hash))) {
+            if (!sendMessageFail(queryDht, nodePortMap.get(hash))) {
                 index = (index + 1) % 5;
-                sendMessage(queryDht, nodePortMap.get(nodeHashList.get(index)));
+                sendMessageFail(queryDht, nodePortMap.get(nodeHashList.get(index)));
             }
             try {
                 sem.acquire();
@@ -249,7 +276,10 @@ public class SimpleDynamoProvider extends ContentProvider {
                     Socket clientHook = serverSocket.accept();
                     BufferedReader reader = new BufferedReader(new InputStreamReader(clientHook.getInputStream()));
                     String message = reader.readLine();
+
                     Log.v(TAG, "Server " + message);
+                    if(message==null)
+                        continue;
                     String[] args = message.split(delim);
 
                     if (args[0].equals(INSERT_KEY)) {
@@ -264,13 +294,22 @@ public class SimpleDynamoProvider extends ContentProvider {
                             String replicationMessage = REPLICATE_KEY + delim + args[1] + delim + args[2];
                             sendMessage(replicationMessage, backupStorePorts[0]);
                         }
+                        Log.v(TAG, "Server " + message);
+                        PrintWriter printWriter = new PrintWriter(clientHook.getOutputStream(), true);
+                        printWriter.println("alive!!");
                     } else if (args[0].equals(REPLICATE_KEY)) {
                         localInsert(args[1], args[2]);
                     } else if (args[0].equals(QUERY_KEY)) {
+                        Log.v(TAG, "Server " + message);
+                        PrintWriter printWriter = new PrintWriter(clientHook.getOutputStream(), true);
+                        printWriter.println("query!!");
                         localQuery(args[1], Integer.parseInt(args[2]));
                     } else if (args[0].equals(QUERY_ALL)) {
                         queryAll(message);
                     } else if (args[0].equals(QUERY_RESULT)) {
+                        Log.v(TAG, "Server " + message);
+                        PrintWriter printWriter = new PrintWriter(clientHook.getOutputStream(), true);
+                        printWriter.println("Result");
                         message = message.substring(message.indexOf(delim) + 1);
                         message = message.substring(message.indexOf(delim) + 1);
                         Log.v(TAG, "Message " + message + " " + args[1]);
@@ -283,8 +322,34 @@ public class SimpleDynamoProvider extends ContentProvider {
                         Log.v("Delete", "Delete local file " + args[1]);
                         File del = new File(getContext().getFilesDir().getAbsolutePath() + "/" + args[1]);
                         del.delete();
+                    } else if (args[0].equals(JOIN_PREV_NODE)) {
+                        Log.v(TAG, "Handle prev join " + args[1]);
+                        String result = localJoinQuery(null);
+                        Log.v(TAG, "Join result " + result);
+                        if (result != null) {
+                            result = JOIN_RESULT + delim + result;
+                            sendMessage(result, Integer.parseInt(args[1]));
+                        }
+                    } else if (args[0].equals(JOIN_NEXT)) {
+                        int hash = Integer.parseInt(args[1]);
+                        hash = hash / 2;
+                        String result = localJoinQuery(genHash(String.valueOf(hash)));
+                        Log.v(TAG, "Join next result " + result);
+                        if (result != null) {
+                            result = JOIN_RESULT + delim + result;
+                            sendMessage(result, hash * 2);
+                        }
+                    } else if (args[0].equals(JOIN_RESULT)) {
+                        args = message.split(delim);
+                        for (int i = 1; i < args.length; i = i + 2) {
+                            localInsert(args[i], args[i+1]);
+                        }
                     }
+                    Log.v(TAG, "Server " + message);
+                    PrintWriter printWriter = new PrintWriter(clientHook.getOutputStream(), true);
+                    printWriter.println("alive!!");
                     clientHook.close();
+
                     //serverSocket.close();
                 } catch (IOException e) {
                     e.printStackTrace();
@@ -299,7 +364,7 @@ public class SimpleDynamoProvider extends ContentProvider {
     }
 
     private void localInsert(String key, String value) {
-        Log.v("Insert", key + " " + value);
+        Log.v("Insert local", key + " " + value);
         FileOutputStream key_store = null;
         try {
             key_store = getContext().openFileOutput(key, Context.MODE_PRIVATE);
@@ -350,7 +415,7 @@ public class SimpleDynamoProvider extends ContentProvider {
             fin = true;
         }
         //Failure handling
-        if (!sendMessage(message, backupStorePorts[0])) {
+        if (!sendMessageFail(message, backupStorePorts[0])) {
             if (!fin && backupStorePorts[1] == Integer.parseInt(args[1])) {
                 message = message.substring(message.indexOf(delim) + 1);
                 if (message.indexOf(delim) >= 0) {
@@ -358,7 +423,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                 } else {
                     message = "";
                 }
-                message = QUERY_RESULT + delim + "*" + message;
+                message = QUERY_RESULT + delim + "*" + delim + message;
                 fin = true;
             }
             sendMessage(message, backupStorePorts[1]);
@@ -397,6 +462,48 @@ public class SimpleDynamoProvider extends ContentProvider {
         return queryAll;
     }
 
+    private String localJoinQuery(String hash) {
+        File dir = getContext().getFilesDir();
+        String[] files = dir.list();
+        String queryAll = null;
+        FileInputStream key_retrieve;
+        String message;
+        boolean flag = false;
+
+        for (String file : files) {
+
+            Log.v("LocalQuery", file);
+            try {
+                flag = false;
+                key_retrieve = getContext().openFileInput(file);
+                if (hash == null && !isInHashSpace(genHash(file), prevNodeID, localNodeID)) {
+                    Log.v(TAG, "err??");
+                    flag = true;
+                } else if (hash != null) {
+                    int index = nodeHashList.indexOf(hash);
+                    String prevHash = nodeHashList.get((index + 4) % 5);
+                    if (!isInHashSpace(genHash(file), prevHash, hash))
+                        flag = true;
+                }
+                if (key_retrieve == null || flag == true)
+                    message = null;
+                else {
+                    BufferedReader buf = new BufferedReader(new InputStreamReader(key_retrieve));
+                    message = buf.readLine();
+                    if (queryAll == null)
+                        queryAll = file + delim + message + delim;
+                    else
+                        queryAll = queryAll + file + delim + message + delim;
+                }
+            } catch (FileNotFoundException e) {
+                e.printStackTrace();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+        return queryAll;
+    }
+
     private void deleteLocal() {
         File dir = getContext().getFilesDir();
         File[] deleteKeys = dir.listFiles();
@@ -407,20 +514,51 @@ public class SimpleDynamoProvider extends ContentProvider {
     }
 
     private boolean sendMessage(String message, Integer port) {
+        boolean ret = false;
         try {
             Log.v(TAG, "Client sends: " + message + " to " + port);
             Socket join = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
                     port);
-            OutputStream out = (join.getOutputStream());
-            //TODO failures
-            byte[] byteStream = message.getBytes("UTF-8");
-            out.write(byteStream);
 
+            PrintWriter printWriter = new PrintWriter(join.getOutputStream(), true);
+            printWriter.println(message);
+//            Log.v(TAG, "values sent " + message);
+//            join.setSoTimeout(5000);
+//            BufferedReader reader = new BufferedReader(new InputStreamReader(join.getInputStream()));
+//            String stuff = reader.readLine();
+//            if(stuff!=null)
+//                ret = true;
+//            Log.v(TAG, "received " + stuff + " " + message);
             join.close();
         } catch (IOException e) {
             e.printStackTrace();
+            ret = false;
         }
         return true;
+    }
+    private boolean sendMessageFail(String message, Integer port) {
+        boolean ret = false;
+        try {
+            Log.v(TAG, "Client sends: " + message + " to " + port);
+            Socket join = new Socket(InetAddress.getByAddress(new byte[]{10, 0, 2, 2}),
+                    port);
+
+            PrintWriter printWriter = new PrintWriter(join.getOutputStream(), true);
+            printWriter.println(message);
+
+            Log.v(TAG, "values sent " + message);
+            join.setSoTimeout(5000);
+            BufferedReader reader = new BufferedReader(new InputStreamReader(join.getInputStream()));
+            String stuff = reader.readLine();
+            if(stuff!=null)
+                ret = true;
+            Log.v(TAG, "received " + stuff + " " + message);
+            join.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+            ret = false;
+        }
+        return ret;
     }
 
     private String findNode(String hash) {
@@ -447,4 +585,5 @@ public class SimpleDynamoProvider extends ContentProvider {
             return false;
         }
     }
+
 }
